@@ -1,37 +1,95 @@
-# nohup /home/tangxinyu/anaconda3/envs/ictl/bin/python src/download/download.py >> logs/download.log 2>&1 &
+# 后台运行命令: nohup python ./src/download/download.py > logs/rmrb_downloader.log 2>&1 & 
 
 import requests
 import bs4
 import os
+import sys
 import datetime
 import time
-import logging
+import json
+from tqdm import tqdm
 
-class PeopleDailyCrawler:
-    def __init__(self):
-        self.headers = {
+ODQA_ROOT_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ODQA_ROOT_PATH)
+
+class RMRBDownloader:
+    def __init__(self, begin_date=None, end_date=None, dest_dir="./data/PeoplesDaily"):
+        """
+        人民日报爬虫类初始化
+        :param begin_date: 开始日期(格式如20220706)
+        :param end_date: 结束日期(格式如20220706)
+        :param dest_dir: 保存文件的目录
+        """
+        self.begin_date = begin_date
+        self.end_date = end_date
+        self.dest_dir = dest_dir
+        self.data_dict = {}
+        
+        # 添加重试配置
+        self.max_retries = 3
+        self.retry_delay = 2  # 秒
+
+    def _fetch_url(self, url, retries=None):
+        """
+        获取网页内容，支持重试机制
+        :param url: 要获取的URL
+        :param retries: 当前重试次数
+        :return: 网页内容或None
+        """
+        if retries is None:
+            retries = self.max_retries
+            
+        headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36',
         }
-        # 设置日志
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
 
-    def _fetch_url(self, url):
         try:
-            r = requests.get(url, headers=self.headers, timeout=30)
+            r = requests.get(url, headers=headers, timeout=10)  # 添加超时设置
+            
+            # 检查状态码
+            if r.status_code == 404:
+                return None
+                
             r.raise_for_status()
             r.encoding = r.apparent_encoding
             return r.text
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"获取URL失败: {url}, 错误: {str(e)}")
+            
+        except requests.exceptions.Timeout:
+            if retries > 0:
+                time.sleep(self.retry_delay)
+                return self._fetch_url(url, retries - 1)
+            else:
+                return None
+                
+        except requests.exceptions.HTTPError as e:
+            if retries > 0 and e.response.status_code >= 500:  # 只有服务器错误才重试
+                time.sleep(self.retry_delay)
+                return self._fetch_url(url, retries - 1)
+            else:
+                return None
+                
+        except requests.exceptions.ConnectionError:
+            if retries > 0:
+                time.sleep(self.retry_delay)
+                return self._fetch_url(url, retries - 1)
+            else:
+                return None
+                
+        except requests.exceptions.RequestException:
             return None
 
     def _get_page_list(self, year, month, day):
+        """
+        获取版面列表
+        :return: 版面URL列表
+        """
         url = f'http://paper.people.com.cn/rmrb/html/{year}-{month}/{day}/nbs.D110000renmrb_01.htm'
+        print(f"🔍 正在获取版面列表: {year}-{month}-{day}")
+        
         html = self._fetch_url(url)
-        if not html:
-            self.logger.warning(f"无法获取 {year}-{month}-{day} 的页面列表")
+        if html is None:
+            print(f"❌ 日期 {year}-{month}-{day} 的版面列表获取失败，可能该日报纸不存在")
             return []
             
         try:
@@ -40,22 +98,39 @@ class PeopleDailyCrawler:
             if temp:
                 pageList = temp.ul.find_all('div', attrs={'class': 'right_title-name'})
             else:
-                pageList = bsobj.find('div', attrs={'class': 'swiper-container'}).find_all('div', attrs={'class': 'swiper-slide'})
-            
+                pageList = bsobj.find('div', attrs={
+                                    'class': 'swiper-container'}).find_all('div', attrs={'class': 'swiper-slide'})
+                                    
+            if not pageList:
+                print(f"⚠️ 日期 {year}-{month}-{day} 的版面列表为空，可能页面结构已改变")
+                return []
+                
             linkList = []
             for page in pageList:
-                link = page.a["href"]
-                url = f'http://paper.people.com.cn/rmrb/html/{year}-{month}/{day}/{link}'
-                linkList.append(url)
+                try:
+                    link = page.a["href"]
+                    url = f'http://paper.people.com.cn/rmrb/html/{year}-{month}/{day}/{link}'
+                    linkList.append(url)
+                except (AttributeError, KeyError):
+                    continue
+            
+            print(f"✅ 日期 {year}-{month}-{day} 成功获取 {len(linkList)} 个版面")
             return linkList
+            
         except Exception as e:
-            self.logger.error(f"解析页面列表失败: {year}-{month}-{day}, 错误: {str(e)}")
+            print(f"❌ 解析版面列表异常: {year}-{month}-{day} - {str(e)}")
             return []
 
-    def _get_title_list(self, year, month, day, pageUrl):
-        html = self._fetch_url(pageUrl)
-        if not html:
-            self.logger.warning(f"无法获取标题列表: {pageUrl}")
+    def _get_title_list(self, year, month, day, page_url):
+        """
+        获取文章列表
+        :return: 文章URL列表
+        """
+        print(f"📋 正在获取版面文章: {page_url.split('/')[-1]}")
+        
+        html = self._fetch_url(page_url)
+        if html is None:
+            print(f"❌ 版面文章列表获取失败: {page_url}")
             return []
             
         try:
@@ -64,129 +139,291 @@ class PeopleDailyCrawler:
             if temp:
                 titleList = temp.ul.find_all('li')
             else:
-                titleList = bsobj.find('ul', attrs={'class': 'news-list'}).find_all('li')
-            
+                titleList = bsobj.find(
+                    'ul', attrs={'class': 'news-list'}).find_all('li')
+                    
+            if not titleList:
+                print(f"⚠️ 版面文章列表为空: {page_url}")
+                return []
+                
             linkList = []
             for title in titleList:
-                tempList = title.find_all('a')
-                for temp in tempList:
-                    link = temp["href"]
-                    if 'nw.D110000renmrb' in link:
-                        url = f'http://paper.people.com.cn/rmrb/html/{year}-{month}/{day}/{link}'
-                        linkList.append(url)
+                try:
+                    tempList = title.find_all('a')
+                    for temp in tempList:
+                        link = temp["href"]
+                        if 'nw.D110000renmrb' in link:
+                            url = f'http://paper.people.com.cn/rmrb/html/{year}-{month}/{day}/{link}'
+                            linkList.append(url)
+                except (AttributeError, KeyError):
+                    continue
+            
+            print(f"✅ 版面 {page_url.split('/')[-1]} 成功获取 {len(linkList)} 篇文章链接")
             return linkList
+            
         except Exception as e:
-            self.logger.error(f"解析标题列表失败: {pageUrl}, 错误: {str(e)}")
+            print(f"❌ 解析文章列表异常: {page_url} - {str(e)}")
             return []
 
-    def _get_content(self, html):
+    def _get_content(self, html, url):
+        """
+        获取文章内容
+        :return: 文章内容字典或None
+        """
+        if not html:
+            print(f"❌ 获取失败: {url} (无HTML内容)")
+            return None
+            
+        print(f"📄 正在解析: {url}")    
         try:
             bsobj = bs4.BeautifulSoup(html, 'html.parser')
-            title = bsobj.h3.text + '\n' + bsobj.h1.text + '\n' + bsobj.h2.text + '\n'
             
-            pList = bsobj.find('div', attrs={'id': 'ozoom'}).find_all('p')
+            # 获取标题，处理可能缺失的情况
+            title_parts = []
+            for title_tag in ['h3', 'h1', 'h2']:
+                try:
+                    tag = bsobj.find(title_tag)
+                    if tag:
+                        title_parts.append(tag.text)
+                except:
+                    pass
+                    
+            if not title_parts:
+                title = "无标题"
+                print(f"⚠️ 警告: 未找到标题 - {url}")
+            else:
+                title = '\n'.join(title_parts)
+                
+            # 获取内容
+            content_div = bsobj.find('div', attrs={'id': 'ozoom'})
+            if not content_div:
+                print(f"❌ 获取失败: {url} (未找到内容区域)")
+                return None
+                
+            pList = content_div.find_all('p')
+            if not pList:
+                print(f"❌ 获取失败: {url} (内容为空)")
+                return None
+                
             content = ''
             for p in pList:
                 content += p.text + '\n'
+                
+            content_stripped = content.strip()
+            title_stripped = title.strip()
+            resp = {"url": url, "title": title_stripped, "content": content_stripped}
             
-            return title + content
+            # 打印成功信息，显示标题和内容长度
+            print(f"✅ 成功获取: [{title_stripped[:20]}{'...' if len(title_stripped) > 20 else ''}] ({len(content_stripped)} 字符)")
+            return resp
+            
+        except AttributeError as e:
+            print(f"❌ 解析错误: {url} - 属性错误: {str(e)}")
+            return None
         except Exception as e:
-            self.logger.error(f"解析文章内容失败, 错误: {str(e)}")
-            return "获取内容失败"
+            print(f"❌ 未知错误: {url} - {str(e)}")
+            return None
 
-    def _save_file(self, content, path, filename):
+    def _save_json_file(self, data, path, filename):
+        """
+        保存JSON文件
+        """
+        if not data:
+            return False
+            
         try:
             if not os.path.exists(path):
                 os.makedirs(path)
-            
+                
             with open(os.path.join(path, filename), 'w', encoding='utf-8') as f:
-                f.write(content)
+                json.dump(data, f, ensure_ascii=False, indent=4)
+                
             return True
-        except Exception as e:
-            self.logger.error(f"保存文件失败: {path}/{filename}, 错误: {str(e)}")
+            
+        except IOError:
+            return False
+        except Exception:
             return False
 
-    def _download_day(self, year, month, day, destdir):
+    def _download_rmrb(self, year, month, day):
+        """
+        下载指定日期的人民日报文章
+        """
+        print(f"📅 开始下载 {year}-{month}-{day} 的文章")
+        
         pageList = self._get_page_list(year, month, day)
         if not pageList:
-            self.logger.warning(f"没有找到 {year}-{month}-{day} 的任何页面")
+            print(f"📭 日期 {year}-{month}-{day} 没有可用版面，跳过")
             return 0
             
         article_count = 0
-        for page in pageList:
+        downloaded_count = 0
+        
+        for i, page in enumerate(pageList, 1):
+            print(f"⏳ 处理第 {i}/{len(pageList)} 个版面: {page.split('/')[-1]}")
             titleList = self._get_title_list(year, month, day, page)
-            for url in titleList:
-                try:
-                    html = self._fetch_url(url)
-                    if not html:
-                        continue
-                        
-                    content = self._get_content(html)
-                    
-                    temp = url.split('_')[2].split('.')[0].split('-')
-                    pageNo = temp[1]
-                    titleNo = temp[0] if int(temp[0]) >= 10 else '0' + temp[0]
-                    path = os.path.join(destdir, f'{year}{month}{day}')
-                    fileName = f'{year}{month}{day}-{pageNo}-{titleNo}.txt'
-                    
-                    if self._save_file(content, path, fileName):
-                        article_count += 1
-                except Exception as e:
-                    self.logger.error(f"处理文章失败: {url}, 错误: {str(e)}")
+            article_count += len(titleList)
+            
+            if not titleList:
+                continue
+                
+            for j, url in enumerate(titleList, 1):
+                print(f"  ⏳ 处理第 {j}/{len(titleList)} 篇文章...")
+                html = self._fetch_url(url)
+                if html is None:
                     continue
                     
-        return article_count
+                content = self._get_content(html, url)
+                if content is None:
+                    continue
+                    
+                key = f'{year}{month}'
+                if key not in self.data_dict:
+                    self.data_dict[key] = []
+                    
+                self.data_dict[key].append(content)
+                downloaded_count += 1
+                
+                # 添加爬取延迟，避免请求过于频繁
+                time.sleep(0.5)
+        
+        success_rate = 0 if article_count == 0 else (downloaded_count / article_count) * 100
+        print(f"📊 日期 {year}-{month}-{day} 统计: {downloaded_count}/{article_count} 篇文章下载成功 (成功率: {success_rate:.1f}%)")
+        return downloaded_count
 
-    @staticmethod
-    def _gen_dates(b_date, days):
+    def _gen_dates(self, b_date, days):
+        """生成日期序列"""
         day = datetime.timedelta(days=1)
         for i in range(days):
             yield b_date + day * i
 
-    def download(self, begin_date, end_date, output_dir='./output'):
-        """
-        下载人民日报指定日期范围内的文章
-        
-        参数:
-            begin_date (str): 开始日期，格式如'20220706'
-            end_date (str): 结束日期，格式如'20220708'
-            output_dir (str): 输出目录，默认为'./output'
-        """
+    def _get_date_list(self, begin_date, end_date):
+        """获取日期范围列表"""
         try:
             start = datetime.datetime.strptime(begin_date, "%Y%m%d")
             end = datetime.datetime.strptime(end_date, "%Y%m%d")
-        except ValueError as e:
-            self.logger.error(f"日期格式错误: {str(e)}")
-            print("日期格式错误，请使用'YYYYMMDD'格式")
-            return
+            
+            if start > end:
+                return []
+                
+            data = []
+            for d in self._gen_dates(start, (end-start).days + 1):  # +1确保包含结束日期
+                data.append(d)
+                
+            return data
+            
+        except ValueError:
+            return []
+            
+    def clean_json_files(self):
+        for filename in tqdm(os.listdir(self.dest_dir)):
+            if filename.endswith(".json"):
+                file_path = os.path.join(self.dest_dir, filename)
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    data = json.load(file)
 
-        print('---人民日报文章爬取系统---')
-        total_articles = 0
-        failed_days = []
+                # 保留不符合条件的条目
+                cleaned_data = [
+                    item for item in data if '本版责编' not in item['title'] and item['content'].strip() != '']
+
+                with open(file_path, 'w', encoding='utf-8') as file:
+                    json.dump(cleaned_data, file, ensure_ascii=False, indent=4)
+                    
+    def run(self):
+        """
+        运行爬虫
+        :return: 文章数据字典
+        """ 
+        if not self.begin_date or not self.end_date:
+            print("❌ 错误: 开始日期和结束日期不能为空")
+            return None
         
-        for d in self._gen_dates(start, (end-start).days + 1):
+        print(f"🚀 开始爬取人民日报文章，日期范围: {self.begin_date} 至 {self.end_date}")
+        
+        data = self._get_date_list(self.begin_date, self.end_date)
+        if not data:
+            print("❌ 错误: 日期列表为空，无法继续")
+            return None
+            
+        print(f"📆 共有 {len(data)} 天需要处理")
+        
+        self.data_dict = {}
+        total_articles = 0
+        success_days = 0
+        empty_days = 0
+
+        # 使用tqdm显示进度
+        for d in tqdm(data, desc="📈 爬取进度"):
             year = str(d.year)
             month = str(d.month) if d.month >= 10 else '0' + str(d.month)
             day = str(d.day) if d.day >= 10 else '0' + str(d.day)
             
-            print(f'正在下载 {year}/{month}/{day} 的文章...')
-            articles = self._download_day(year, month, day, output_dir)
+            print(f"\n{'='*50}")
+            print(f"📅 开始处理 {year}-{month}-{day}")
+            print(f"{'='*50}")
             
-            if articles > 0:
-                print(f'已下载 {year}/{month}/{day} 的 {articles} 篇文章')
+            try:
+                articles = self._download_rmrb(year, month, day)
                 total_articles += articles
-            else:
-                print(f'警告: {year}/{month}/{day} 没有成功下载任何文章')
-                failed_days.append(f'{year}/{month}/{day}')
+                
+                if articles > 0:
+                    success_days += 1
+                else:
+                    empty_days += 1
+                    
+                print(f"✓ {year}-{month}-{day} 完成，获取 {articles} 篇文章")
+                print(f"{'='*50}\n")
+            except Exception as e:
+                print(f"❌ 处理 {year}-{month}-{day} 时出错: {str(e)}")
+                empty_days += 1
+                print(f"{'='*50}\n")
+                continue
+
+        if not self.data_dict:
+            print("⚠️ 警告: 未获取到任何文章内容")
+            return {}
+
+        # 保存数据
+        print("💾 正在保存数据...")
+        saved_files = 0
+        for key, value in self.data_dict.items():
+            if not value:
+                continue
+                
+            year, month = key[:4], key[4:]
+            filename = f'{year}-{month}.json'
+            if self._save_json_file(value, self.dest_dir, filename):
+                saved_files += 1
+                print(f"✅ 已保存: {filename} ({len(value)} 篇文章)")
         
-        print('---文章爬取完成---')
-        print(f'共下载 {total_articles} 篇文章')
-        if failed_days:
-            print(f'以下日期没有成功下载文章: {", ".join(failed_days)}')
-        print(f'所有文章已保存至: {os.path.abspath(output_dir)}')
+        print(f"\n{'='*50}")
+        print(f"📊 爬取统计:")
+        print(f"   📑 总文章数: {total_articles} 篇")
+        print(f"   📁 保存文件: {saved_files} 个")
+        print(f"   📅 成功天数: {success_days}/{len(data)} 天")
+        print(f"   📭 空内容天数: {empty_days}/{len(data)} 天")
+        print(f"{'='*50}")
+        return self.data_dict
 
 
-# 使用示例
 if __name__ == '__main__':
-    crawler = PeopleDailyCrawler()
-    crawler.download('20230501', '20240430', './data/rmrb')
+    print("\n" + "="*60)
+    print("🗞️  人民日报文章爬虫 v1.0")
+    print("="*60)
+    
+    # 示例用法
+    dir = "./data/PeoplesDaily"
+    if os.path.exists(dir):
+        print("🧹 清理现有JSON文件中...")
+        downloader = RMRBDownloader('20230501', '20240430')
+        downloader.clean_json_files()
+        print("✅ 文件清理完成！")
+    else:
+        print("🔍 开始爬取人民日报文章，日期范围: 20230501 至 20240430")
+        downloader = RMRBDownloader('20230501', '20240430')
+        downloader.run()
+        print("🧹 开始清理JSON文件...")
+        downloader.clean_json_files()
+        print("✅ 任务全部完成！")
+    
+    print("="*60)

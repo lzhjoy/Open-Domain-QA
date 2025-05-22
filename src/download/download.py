@@ -27,7 +27,7 @@ class RMRBDownloader:
         
         # 添加重试配置
         self.max_retries = 3
-        self.retry_delay = 2  # 秒
+        self.retry_delay = 0  # 秒
 
     def _fetch_url(self, url, retries=None):
         """
@@ -258,6 +258,7 @@ class RMRBDownloader:
             
         article_count = 0
         downloaded_count = 0
+        daily_articles = []
         
         for i, page in enumerate(pageList, 1):
             print(f"⏳ 处理第 {i}/{len(pageList)} 个版面: {page.split('/')[-1]}")
@@ -276,16 +277,18 @@ class RMRBDownloader:
                 content = self._get_content(html, url)
                 if content is None:
                     continue
-                    
-                key = f'{year}{month}'
-                if key not in self.data_dict:
-                    self.data_dict[key] = []
-                    
-                self.data_dict[key].append(content)
+                
+                daily_articles.append(content)
                 downloaded_count += 1
                 
                 # 添加爬取延迟，避免请求过于频繁
-                time.sleep(0.5)
+                # time.sleep(0.5)
+        
+        # 将当天文章保存到数据字典
+        key = f'{year}{month}'
+        if key not in self.data_dict:
+            self.data_dict[key] = []
+        self.data_dict[key].extend(daily_articles)
         
         success_rate = 0 if article_count == 0 else (downloaded_count / article_count) * 100
         print(f"📊 日期 {year}-{month}-{day} 统计: {downloaded_count}/{article_count} 篇文章下载成功 (成功率: {success_rate:.1f}%)")
@@ -349,14 +352,36 @@ class RMRBDownloader:
         
         self.data_dict = {}
         total_articles = 0
+        saved_files = 0
         success_days = 0
         empty_days = 0
-
+        
+        # 按月分组处理
+        current_month = None
+        
         # 使用tqdm显示进度
         for d in tqdm(data, desc="📈 爬取进度"):
             year = str(d.year)
             month = str(d.month) if d.month >= 10 else '0' + str(d.month)
             day = str(d.day) if d.day >= 10 else '0' + str(d.day)
+            year_month = f"{year}{month}"
+            
+            # 如果月份变化，保存前一个月的数据
+            if current_month and current_month != year_month and current_month in self.data_dict and self.data_dict[current_month]:
+                print(f"\n{'='*50}")
+                print(f"💾 保存 {current_month[:4]}-{current_month[4:]} 月数据...")
+                filename = f"{current_month[:4]}-{current_month[4:]}.json"
+                
+                if self._save_json_file(self.data_dict[current_month], self.dest_dir, filename):
+                    saved_files += 1
+                    article_count = len(self.data_dict[current_month])
+                    print(f"✅ 已保存: {filename} ({article_count} 篇文章)")
+                    
+                # 清空已保存的月份数据，减少内存占用
+                self.data_dict[current_month] = []
+            
+            # 更新当前月份
+            current_month = year_month
             
             print(f"\n{'='*50}")
             print(f"📅 开始处理 {year}-{month}-{day}")
@@ -373,25 +398,24 @@ class RMRBDownloader:
                     
                 print(f"✓ {year}-{month}-{day} 完成，获取 {articles} 篇文章")
                 print(f"{'='*50}\n")
+                
             except Exception as e:
                 print(f"❌ 处理 {year}-{month}-{day} 时出错: {str(e)}")
                 empty_days += 1
                 print(f"{'='*50}\n")
                 continue
-
-        if not self.data_dict:
-            print("⚠️ 警告: 未获取到任何文章内容")
-            return {}
-
-        # 保存数据
-        print("💾 正在保存数据...")
-        saved_files = 0
+        
+        # 保存最后一个月的数据
         for key, value in self.data_dict.items():
-            if not value:
+            if not value:  # 跳过空数据
                 continue
                 
             year, month = key[:4], key[4:]
             filename = f'{year}-{month}.json'
+            
+            print(f"\n{'='*50}")
+            print(f"💾 保存 {year}-{month} 月数据...")
+            
             if self._save_json_file(value, self.dest_dir, filename):
                 saved_files += 1
                 print(f"✅ 已保存: {filename} ({len(value)} 篇文章)")
@@ -421,6 +445,7 @@ if __name__ == '__main__':
     else:
         print("🔍 开始爬取人民日报文章，日期范围: 20230501 至 20240430")
         downloader = RMRBDownloader('20230501', '20240430')
+        # downloader = RMRBDownloader('20230501', '20230502')
         downloader.run()
         print("🧹 开始清理JSON文件...")
         downloader.clean_json_files()
